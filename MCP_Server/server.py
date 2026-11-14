@@ -612,7 +612,8 @@ def get_session_snapshot(
         )
         return json.dumps(result, indent=2)
     except Exception as e:
-        logger.error(f"Error getting session snapshot: {str(e)}")
+        logger.exception("Error getting session snapshot (include_notes=%s, include_params=%s)",
+                         include_notes, include_params)
         return f"Error getting session snapshot: {str(e)}"
 
 

@@ -2,6 +2,10 @@
 
 # Ableton MCP
 
+Personal fork maintained at [jharlas/ableton-mcp](https://github.com/jharlas/ableton-mcp).
+See [BASELINE.md](BASELINE.md) for provenance, the preserved snapshot fixes,
+validation, and the `baseline-2026-11-14` reference tag.
+
 **Connect Ableton Live to Claude AI**
 
 Prompt-assisted music production, end-to-end track creation, and Live session and arrangement manipulation — driven by AI.

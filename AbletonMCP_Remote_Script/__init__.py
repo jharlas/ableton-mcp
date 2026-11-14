@@ -21,7 +21,7 @@ HOST = "0.0.0.0"
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.18.0"
+SCRIPT_VERSION = "1.18.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -303,7 +303,7 @@ class AbletonMCP(ControlSurface):
             if command_type == "get_script_info":
                 response["result"] = self._get_script_info()
             elif command_type == "get_session_info":
-                response["result"] = self._get_session_info()
+                response["result"] = self._read_song_on_main_thread(self._get_session_info)
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
@@ -650,9 +650,10 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_session_snapshot":
                 include_notes = params.get("include_notes", True)
                 include_params = params.get("include_params", True)
-                response["result"] = self._get_session_snapshot(
-                    include_notes=include_notes,
-                    include_params=include_params,
+                response["result"] = self._read_song_on_main_thread(
+                    lambda: self._get_session_snapshot(
+                        include_notes=include_notes, include_params=include_params
+                    )
                 )
             elif command_type == "drain_passive_events":
                 response["result"] = self._drain_passive_events()
@@ -713,6 +714,62 @@ class AbletonMCP(ControlSurface):
             "passive_listeners": True,
         }
     
+    def _read_song_on_main_thread(self, reader):
+        """Live objects must not be dereferenced on a socket worker thread."""
+        replies = queue.Queue()
+
+        def collect():
+            try:
+                # Reacquire the current Live binding after Set changes.
+                self._song = self.song()
+                self.log_message("Song read %s on thread %s" % (
+                    reader.__name__, threading.current_thread().name))
+                replies.put((True, reader()))
+            except Exception as exc:
+                self.log_message("Song read failed on main thread\n" + traceback.format_exc())
+                replies.put((False, exc))
+
+        # Never fall back to executing Live API calls on the worker thread.
+        self.schedule_message(1, collect)
+        try:
+            ok, result = replies.get(timeout=8.0)
+        except queue.Empty:
+            raise RuntimeError("Timed out waiting for Live main-thread Song read")
+        if not ok:
+            raise result
+        return result
+
+    def _snapshot_failure(self, label):
+        """Full traceback plus object path; log each property failure once per read."""
+        seen = getattr(self, "_snapshot_failures", None)
+        if seen is None:
+            return
+        if label not in seen:
+            seen.add(label)
+            self.log_message("Snapshot property failed: %s\n%s" % (
+                getattr(self, "_snapshot_path", "snapshot") + "." + label, traceback.format_exc()))
+
+    def _snapshot_try(self, label, read, default=None):
+        previous = getattr(self, "_snapshot_path", "snapshot")
+        self._snapshot_path = previous + "." + label
+        try:
+            return read()
+        except Exception:
+            self._snapshot_path = previous
+            self._snapshot_failure(label)
+            return default
+        finally:
+            self._snapshot_path = previous
+
+    def _snapshot_items(self, label, items, serialize):
+        result = []
+        for i, item in enumerate(items):
+            value = self._snapshot_try(
+                "%s[%d]" % (label, i), lambda: serialize(item, i))
+            if value is not None:
+                result.append(value)
+        return result
+
     def _safe_song_property(self, attr, cast, default):
         """Read self._song.<attr> with cast, returning default on common failures.
         Catches only narrow exceptions so genuine bugs still surface."""
@@ -732,8 +789,10 @@ class AbletonMCP(ControlSurface):
                 "return_track_count": len(self._song.return_tracks),
                 "master_track": {
                     "name": "Master",
-                    "volume": self._song.master_track.mixer_device.volume.value,
-                    "panning": self._song.master_track.mixer_device.panning.value
+                    "volume": self._snapshot_try("session.master_track.volume",
+                        lambda: self._song.master_track.mixer_device.volume.value),
+                    "panning": self._snapshot_try("session.master_track.panning",
+                        lambda: self._song.master_track.mixer_device.panning.value)
                 },
                 # Read via _safe_song_property so an attribute missing on a
                 # given Live version falls back to its default.
@@ -746,7 +805,7 @@ class AbletonMCP(ControlSurface):
             }
             return result
         except Exception as e:
-            self.log_message("Error getting session info: " + str(e))
+            self.log_message("Error getting session info (Song properties)\n" + traceback.format_exc())
             raise
     
     def _get_track_info(self, track_index):
@@ -2911,6 +2970,7 @@ class AbletonMCP(ControlSurface):
                 return cast(val)
             return val
         except Exception:
+            self._snapshot_failure("%s.%s" % (type(obj).__name__, attr))
             return default
 
     def _notes_from_clip(self, clip):
@@ -2921,7 +2981,7 @@ class AbletonMCP(ControlSurface):
 
         if hasattr(clip, "get_notes_extended"):
             try:
-                raw = clip.get_notes_extended(0, 128, 0.0, float(clip.length) + 1.0)
+                raw = clip.get_notes_extended(0, 128, 0.0, self._safe_attr(clip, "length", float, 0.0) + 1.0)
                 for n in raw:
                     entry = {
                         "pitch": int(getattr(n, "pitch", 0)),
@@ -2950,11 +3010,11 @@ class AbletonMCP(ControlSurface):
                     notes.append(entry)
                 return notes
             except Exception as e:
-                self.log_message("get_notes_extended failed, falling back: " + str(e))
+                self.log_message("get_notes_extended failed, falling back: " + str(e) + "\n" + traceback.format_exc())
 
         if hasattr(clip, "get_notes"):
             try:
-                raw = clip.get_notes(0.0, 0, float(clip.length) + 1.0, 128)
+                raw = clip.get_notes(0.0, 0, self._safe_attr(clip, "length", float, 0.0) + 1.0, 128)
                 for n in raw:
                     notes.append({
                         "pitch": int(n[0]),
@@ -2964,7 +3024,7 @@ class AbletonMCP(ControlSurface):
                         "mute": bool(n[4]) if len(n) > 4 else False,
                     })
             except Exception as e:
-                self.log_message("get_notes failed: " + str(e))
+                self.log_message("get_notes failed: " + str(e) + "\n" + traceback.format_exc())
         return notes
 
     def _warp_markers_from_clip(self, clip):
@@ -2981,7 +3041,7 @@ class AbletonMCP(ControlSurface):
                     ),
                 })
         except Exception as e:
-            self.log_message("warp_markers read failed: " + str(e))
+            self.log_message("warp_markers read failed: " + str(e) + "\n" + traceback.format_exc())
         return markers
 
     def _automated_params_for_device(self, device):
@@ -3009,8 +3069,8 @@ class AbletonMCP(ControlSurface):
     def _serialize_device(self, device, device_index, include_params=True, depth=0):
         info = {
             "index": device_index,
-            "name": device.name,
-            "class_name": device.class_name,
+            "name": self._safe_attr(device, "name", str, ""),
+            "class_name": self._safe_attr(device, "class_name", str, ""),
             "type": self._get_device_type(device),
         }
         automated = self._automated_params_for_device(device)
@@ -3043,15 +3103,16 @@ class AbletonMCP(ControlSurface):
                                 pass
                         params.append(entry)
                     except Exception:
+                        self._snapshot_failure("device.parameters[%d]" % p_index)
                         continue
             except Exception as e:
-                self.log_message("Error reading device parameters: " + str(e))
+                self.log_message("Error reading device parameters: " + str(e) + "\n" + traceback.format_exc())
             info["parameters"] = params
 
         # Devices inside a rack carry the actual sound design — a drum rack's
         # nested Operator, an instrument rack's filter. Without this walk a rack
         # contributes only its 8 macros and the timbral state is invisible.
-        if getattr(device, "can_have_chains", False):
+        if self._safe_attr(device, "can_have_chains", bool, False):
             if depth >= self._MAX_CHAIN_DEPTH:
                 info["chains_truncated"] = True
             else:
@@ -3074,8 +3135,8 @@ class AbletonMCP(ControlSurface):
                         "index": chain_index,
                         "kind": kind,
                         "chain_name": self._safe_attr(chain, "name", str, ""),
-                        "mute": bool(self._safe_attr(chain, "mute", bool, False)),
-                        "solo": bool(self._safe_attr(chain, "solo", bool, False)),
+                        "mute": self._safe_attr(chain, "mute", bool, False),
+                        "solo": self._safe_attr(chain, "solo", bool, False),
                     }
                     try:
                         mixer = chain.mixer_device
@@ -3092,29 +3153,24 @@ class AbletonMCP(ControlSurface):
 
                     nested = []
                     try:
-                        for d_i, dev in enumerate(chain.devices):
-                            nested.append(
-                                self._serialize_device(
-                                    dev,
-                                    d_i,
-                                    include_params=include_params,
-                                    depth=depth + 1,
-                                )
-                            )
+                        nested = self._snapshot_items(
+                            "chain.devices", self._safe_attr(chain, "devices", list, []),
+                            lambda dev, i: self._serialize_device(
+                                dev, i, include_params=include_params, depth=depth + 1))
                     except Exception as e:
-                        self.log_message("Error reading chain devices: " + str(e))
+                        self.log_message("Error reading chain devices: " + str(e) + "\n" + traceback.format_exc())
                     entry["devices"] = nested
                     chains.append(entry)
         except Exception as e:
-            self.log_message("Error serializing rack chains: " + str(e))
+            self.log_message("Error serializing rack chains: " + str(e) + "\n" + traceback.format_exc())
         return chains
 
     def _serialize_clip_common(self, clip):
         info = {
-            "looping": bool(self._safe_attr(clip, "looping", bool, False)),
+            "looping": self._safe_attr(clip, "looping", bool, False),
             "loop_start": self._safe_attr(clip, "loop_start", float, None),
             "loop_end": self._safe_attr(clip, "loop_end", float, None),
-            "warping": bool(self._safe_attr(clip, "warping", bool, False)),
+            "warping": self._safe_attr(clip, "warping", bool, False),
             "warp_mode": self._safe_attr(clip, "warp_mode", int, None),
             "gain": self._safe_attr(clip, "gain", float, None),
             "pitch_coarse": self._safe_attr(clip, "pitch_coarse", int, None),
@@ -3134,34 +3190,34 @@ class AbletonMCP(ControlSurface):
 
     def _serialize_session_clip(self, clip, include_notes=True):
         info = {
-            "name": clip.name,
-            "length": float(clip.length),
-            "is_playing": bool(clip.is_playing),
-            "is_recording": bool(getattr(clip, "is_recording", False)),
-            "is_midi_clip": bool(getattr(clip, "is_midi_clip", False)),
-            "is_audio_clip": bool(getattr(clip, "is_audio_clip", False)),
-            "color": int(getattr(clip, "color", 0)),
+            "name": self._safe_attr(clip, "name", str, ""),
+            "length": self._safe_attr(clip, "length", float, 0.0),
+            "is_playing": self._safe_attr(clip, "is_playing", bool, False),
+            "is_recording": self._safe_attr(clip, "is_recording", bool, False),
+            "is_midi_clip": self._safe_attr(clip, "is_midi_clip", bool, False),
+            "is_audio_clip": self._safe_attr(clip, "is_audio_clip", bool, False),
+            "color": self._safe_attr(clip, "color", int, 0),
         }
         info.update(self._serialize_clip_common(clip))
         if include_notes and info["is_midi_clip"]:
-            info["notes"] = self._notes_from_clip(clip)
+            info["notes"] = self._snapshot_try("clip.notes", lambda: self._notes_from_clip(clip), [])
             info["note_count"] = len(info["notes"])
         return info
 
     def _serialize_arrangement_clip(self, clip, include_notes=True):
         info = {
-            "name": clip.name,
-            "start_time": float(clip.start_time),
-            "end_time": float(clip.end_time),
-            "length": float(clip.length),
-            "color": int(getattr(clip, "color", 0)),
-            "is_midi_clip": bool(getattr(clip, "is_midi_clip", False)),
-            "is_audio_clip": bool(getattr(clip, "is_audio_clip", False)),
-            "is_playing": bool(getattr(clip, "is_playing", False)),
+            "name": self._safe_attr(clip, "name", str, ""),
+            "start_time": self._safe_attr(clip, "start_time", float, 0.0),
+            "end_time": self._safe_attr(clip, "end_time", float, 0.0),
+            "length": self._safe_attr(clip, "length", float, 0.0),
+            "color": self._safe_attr(clip, "color", int, 0),
+            "is_midi_clip": self._safe_attr(clip, "is_midi_clip", bool, False),
+            "is_audio_clip": self._safe_attr(clip, "is_audio_clip", bool, False),
+            "is_playing": self._safe_attr(clip, "is_playing", bool, False),
         }
         info.update(self._serialize_clip_common(clip))
         if include_notes and info["is_midi_clip"]:
-            info["notes"] = self._notes_from_clip(clip)
+            info["notes"] = self._snapshot_try("clip.notes", lambda: self._notes_from_clip(clip), [])
             info["note_count"] = len(info["notes"])
         return info
 
@@ -3184,12 +3240,12 @@ class AbletonMCP(ControlSurface):
             for i, scene in enumerate(self._song.scenes):
                 scenes.append({
                     "index": i,
-                    "name": str(scene.name),
+                    "name": self._safe_attr(scene, "name", str, ""),
                     "tempo": self._safe_attr(scene, "tempo", float, None),
-                    "is_triggered": bool(self._safe_attr(scene, "is_triggered", bool, False)),
+                    "is_triggered": self._safe_attr(scene, "is_triggered", bool, False),
                 })
         except Exception as e:
-            self.log_message("scenes serialize failed: " + str(e))
+            self.log_message("scenes serialize failed: " + str(e) + "\n" + traceback.format_exc())
         return scenes
 
     def _serialize_cue_points(self):
@@ -3201,7 +3257,7 @@ class AbletonMCP(ControlSurface):
                     "time": float(getattr(cue, "time", 0.0)),
                 })
         except Exception as e:
-            self.log_message("cue_points serialize failed: " + str(e))
+            self.log_message("cue_points serialize failed: " + str(e) + "\n" + traceback.format_exc())
         return cues
 
     def _serialize_return_tracks(self, include_params=True):
@@ -3209,21 +3265,20 @@ class AbletonMCP(ControlSurface):
         try:
             for i, track in enumerate(self._song.return_tracks):
                 devices = []
-                for d_i, device in enumerate(track.devices):
-                    devices.append(
-                        self._serialize_device(device, d_i, include_params=include_params)
-                    )
+                devices = self._snapshot_items(
+                    "track.devices", self._safe_attr(track, "devices", list, []),
+                    lambda device, i: self._serialize_device(device, i, include_params))
                 returns.append({
                     "index": i,
-                    "name": track.name,
-                    "mute": bool(track.mute),
-                    "solo": bool(track.solo),
-                    "volume": float(track.mixer_device.volume.value),
-                    "panning": float(track.mixer_device.panning.value),
+                    "name": self._safe_attr(track, "name", str, ""),
+                    "mute": self._safe_attr(track, "mute", bool, False),
+                    "solo": self._safe_attr(track, "solo", bool, False),
+                    "volume": self._snapshot_try("mixer.volume", lambda: float(track.mixer_device.volume.value)),
+                    "panning": self._snapshot_try("mixer.panning", lambda: float(track.mixer_device.panning.value)),
                     "devices": devices,
                 })
         except Exception as e:
-            self.log_message("return_tracks serialize failed: " + str(e))
+            self.log_message("return_tracks serialize failed: " + str(e) + "\n" + traceback.format_exc())
         return returns
 
     def _serialize_master_track(self, include_params=True):
@@ -3231,17 +3286,16 @@ class AbletonMCP(ControlSurface):
         try:
             track = self._song.master_track
             devices = []
-            for d_i, device in enumerate(track.devices):
-                devices.append(
-                    self._serialize_device(device, d_i, include_params=include_params)
-                )
+            devices = self._snapshot_items(
+                    "track.devices", self._safe_attr(track, "devices", list, []),
+                    lambda device, i: self._serialize_device(device, i, include_params))
             return {
-                "volume": float(track.mixer_device.volume.value),
-                "panning": float(track.mixer_device.panning.value),
+                "volume": self._snapshot_try("mixer.volume", lambda: float(track.mixer_device.volume.value)),
+                "panning": self._snapshot_try("mixer.panning", lambda: float(track.mixer_device.panning.value)),
                 "devices": devices,
             }
         except Exception as e:
-            self.log_message("master_track serialize failed: " + str(e))
+            self.log_message("master_track serialize failed: " + str(e) + "\n" + traceback.format_exc())
             return None
 
     def _get_clip_notes(self, track_index, clip_index):
@@ -3283,84 +3337,67 @@ class AbletonMCP(ControlSurface):
                 "device": self._serialize_device(device, device_index, include_params=True),
             }
         except Exception as e:
-            self.log_message("Error getting device parameters: " + str(e))
+            self.log_message("Error getting device parameters: " + str(e) + "\n" + traceback.format_exc())
             raise
 
+    def _serialize_snapshot_track(self, track, track_index, include_notes, include_params):
+        def slot_info(slot, index):
+            has_clip = self._safe_attr(slot, "has_clip", bool, False)
+            clip = self._snapshot_try("track[%d].slot[%d].clip" % (track_index, index),
+                lambda: self._serialize_session_clip(slot.clip, include_notes)) if has_clip else None
+            return {"index": index, "has_clip": has_clip, "clip": clip}
+
+        prefix = "track[%d]" % track_index
+        return {
+            "index": track_index,
+            "name": self._safe_attr(track, "name", str, ""),
+            "is_audio_track": self._safe_attr(track, "has_audio_input", bool, False),
+            "is_midi_track": self._safe_attr(track, "has_midi_input", bool, False),
+            "mute": self._safe_attr(track, "mute", bool, False),
+            "solo": self._safe_attr(track, "solo", bool, False),
+            "arm": self._snapshot_try(prefix + ".arm", lambda: self._safe_arm(track), False),
+            "volume": self._snapshot_try(prefix + ".mixer.volume", lambda: float(track.mixer_device.volume.value)),
+            "panning": self._snapshot_try(prefix + ".mixer.panning", lambda: float(track.mixer_device.panning.value)),
+            "sends": self._serialize_sends(track),
+            "clip_slots": self._snapshot_items(prefix + ".clip_slots",
+                self._safe_attr(track, "clip_slots", list, []), slot_info),
+            "devices": self._snapshot_items(prefix + ".devices",
+                self._safe_attr(track, "devices", list, []),
+                lambda device, i: self._serialize_device(device, i, include_params)),
+            "arrangement_clips": self._snapshot_items(prefix + ".arrangement_clips",
+                self._safe_attr(track, "arrangement_clips", list, []),
+                lambda clip, i: self._serialize_arrangement_clip(clip, include_notes)),
+        }
+
     def _get_session_snapshot(self, include_notes=True, include_params=True):
-        """Full v2 project state dump for trajectory dataset recording."""
+        """Full v2 snapshot; called on Live's main thread with a fresh Song."""
+        self._snapshot_failures = set()
+        started = time.time()
+        self.log_message("Snapshot begin notes=%s params=%s thread=%s" % (
+            include_notes, include_params, threading.current_thread().name))
         try:
+            # Core Song failures are fatal: never return a fake empty Set.
             session = self._get_session_info()
-            tracks = []
-            for track_index, track in enumerate(self._song.tracks):
-                clip_slots = []
-                for slot_index, slot in enumerate(track.clip_slots):
-                    clip_info = None
-                    if slot.has_clip:
-                        clip_info = self._serialize_session_clip(
-                            slot.clip, include_notes=include_notes
-                        )
-                    clip_slots.append({
-                        "index": slot_index,
-                        "has_clip": bool(slot.has_clip),
-                        "clip": clip_info,
-                    })
-
-                devices = []
-                for device_index, device in enumerate(track.devices):
-                    devices.append(
-                        self._serialize_device(
-                            device, device_index, include_params=include_params
-                        )
-                    )
-
-                arrangement_clips = []
-                try:
-                    for clip in track.arrangement_clips:
-                        arrangement_clips.append(
-                            self._serialize_arrangement_clip(
-                                clip, include_notes=include_notes
-                            )
-                        )
-                except Exception as e:
-                    self.log_message(
-                        "arrangement_clips unavailable on track %d: %s"
-                        % (track_index, str(e))
-                    )
-
-                tracks.append({
-                    "index": track_index,
-                    "name": track.name,
-                    "is_audio_track": bool(track.has_audio_input),
-                    "is_midi_track": bool(track.has_midi_input),
-                    "mute": bool(track.mute),
-                    "solo": bool(track.solo),
-                    "arm": self._safe_arm(track),
-                    "volume": float(track.mixer_device.volume.value),
-                    "panning": float(track.mixer_device.panning.value),
-                    "sends": self._serialize_sends(track),
-                    "clip_slots": clip_slots,
-                    "devices": devices,
-                    "arrangement_clips": arrangement_clips,
-                })
-
+            tracks = self._snapshot_items("tracks", list(self._song.tracks),
+                lambda track, i: self._serialize_snapshot_track(track, i, include_notes, include_params))
             return {
                 "schema": "ableton_mcp_snapshot_v2",
                 "session": session,
                 "tracks": tracks,
                 "scenes": self._serialize_scenes(),
-                "return_tracks": self._serialize_return_tracks(
-                    include_params=include_params
-                ),
-                "master_track": self._serialize_master_track(
-                    include_params=include_params
-                ),
+                "return_tracks": self._serialize_return_tracks(include_params=include_params),
+                "master_track": self._serialize_master_track(include_params=include_params),
                 "cue_points": self._serialize_cue_points(),
                 "include_notes": bool(include_notes),
                 "include_params": bool(include_params),
             }
-        except Exception as e:
-            self.log_message("Error getting session snapshot: " + str(e))
+        except Exception:
+            self.log_message("Snapshot failed\n" + traceback.format_exc())
             raise
+        finally:
+            self.log_message("Snapshot end elapsed=%.3fs property_failures=%d" % (
+                time.time() - started, len(self._snapshot_failures)))
+            self._snapshot_failures = None
 
     def _set_device_parameter(self, track_index, device_index, parameter_index, value):
         try:
