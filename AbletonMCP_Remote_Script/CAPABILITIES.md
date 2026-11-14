@@ -24,6 +24,90 @@ pagination and time semantics, [Troubleshooting](../README.md#troubleshooting)
 for timeouts versus response truncation, and [CHANGELOG.md](../CHANGELOG.md)
 for the changes since the baseline.
 
+## Automation-read feasibility — 2026-11-14
+
+Recommendation: add a read-only automation inventory and paginated envelope
+reader, with two explicit sources: live Session envelopes and saved-Set
+Arrangement envelopes. This is feasible without replacing the MCP server.
+Do not advertise unsaved Arrangement curve reads as supported yet.
+
+### Evidence
+
+- Current server code serializes device parameter values and automation
+  state, but exposes no envelope reader. Mixer, return/master and nested-rack
+  coverage should be explicit in the new inventory rather than inferred
+  from the existing device snapshot.
+- Read-only inspection of the installed Live 12.4.16 executable's Python
+  binding strings found `clip.automation_envelopes`, `Envelope.parameter`,
+  `events_in_range`, `value_at_time`, and envelope-event control coefficients
+  `x1`, `y1`, `x2`, `y2`. These establish an API surface worth probing, not a
+  successful runtime read of the user's open Set.
+- The same installed binding documentation explicitly says
+  `clip.automation_envelope(parameter)` returns `None` for Arrangement
+  clips. A negative result alone is ambiguous because an absent Session
+  envelope also returns `None`. The enumeration path on Arrangement clips
+  has not been tested here; neither it nor direct access to track-level
+  Arrangement envelopes should be assumed to work.
+- A separate [MCP implementation's automation module](https://github.com/whybothercoding/ableton-mcp-server/blob/0a897bf48e032bdd31f36511701b2afaf655eabb/remote-script/AbletonMCP/automation.py)
+  uses the live event API for Session envelopes and treats Arrangement
+  breakpoint access as unavailable. This supports the proposed split but
+  is not a substitute for testing our own bridge.
+- Read-only XML parsing of a local Live 12.4.16 saved Set resolved all seven
+  `AutomationEnvelope` targets: five lanes with timed events and two global
+  initial-state envelopes. Device gain, delay wet/dry and filter-frequency
+  automation were recovered, including duplicate-time events. A second Set
+  also resolved both of its targets. This proves a saved-state reading path,
+  not a general-purpose parser for all devices and Set versions.
+- None of the 27 local non-backup Sets examined supplied curve-control
+  attributes/children on those automation events. Curved-envelope fidelity
+  therefore remains a fixture/runtime validation requirement.
+- The previously considered RichieMiller-HU extended fork, at commit
+  `c065b5c175d172107f7dd8f5aac9a89e05514b9e`, has no automation/envelope code
+  in its main server and Remote Script files; it does not supply this feature.
+
+### Proposed tool contract
+
+1. `list_automation`: choose `live_session` or `saved_arrangement`, and
+   optionally a track/device. Return stable envelope identifiers, target
+   identity, source layer, available representation and event counts.
+2. `read_automation`: choose an envelope and time range; return bounded,
+   paginated events with raw time/value/control data, contextual boundary
+   events, and optional musical summaries. Distinguish exact breakpoints
+   from sampled values; never label samples as the full curve.
+
+Both responses should identify the Set and source. Saved reads must include
+the file fingerprint and modification time, and explicitly state that
+unsaved changes are not included. File freshness alone cannot establish
+whether Live has unsaved edits. Associate files explicitly; do not guess the
+active Set from the working directory or the newest file.
+
+Preserve duplicate-time event order, initial-state sentinels, parameter and
+track/device identities, automation versus modulation, clip versus
+Arrangement time, and marker/loop context. Include return/master tracks and
+nested rack chains. Preserve unknown event/curve fields and flag unresolved
+targets instead of silently dropping them. Report native values separately
+from display units: arbitrary normalized values cannot be labeled dB or Hz
+without a verified parameter-specific mapping. Convert beats to bars only
+with the corresponding meter map.
+
+### Delivery and acceptance
+
+Prioritize saved Arrangement reads because they cover production design
+across a whole song. Follow with a main-thread, read-only Session probe that
+enumerates existing envelopes, reads events and coefficients, and compares
+selected samples with `value_at_time`. Probe Arrangement enumeration too,
+using a known automated parameter as a positive control; record unsupported
+access distinctly from an empty envelope. No clip copying or playback/seek
+is required for the saved reader.
+
+Validate a straight ramp, curved ramp, abrupt jump, duplicate-time events,
+initial defaults, mixer/send and nested-device targets, pagination, stale
+files, and non-4/4 timing before calling the feature production-ready.
+The current writer's staircase approximation is not evidence of lossless
+curve editing. Reading/design advice and applying edits are separate
+features; no production automation reader or writer was added during this
+investigation, and no Live Set or installed Remote Script was modified.
+
 ## Historical audit — v1.13.0
 
 The remainder records the earlier audit and its original verification
