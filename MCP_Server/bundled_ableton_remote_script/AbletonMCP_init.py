@@ -21,7 +21,7 @@ HOST = "0.0.0.0"
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.18.2"
+SCRIPT_VERSION = "1.18.3"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -40,6 +40,7 @@ SCRIPT_CAPABILITIES = [
     "add_notes_to_clip",
     "load_instrument_or_effect",
     "get_arrangement_clips",
+    "get_arrangement_clip_notes",
     "duplicate_session_clip_to_arrangement",
     "create_locator",
     "delete_clip",
@@ -619,10 +620,16 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_browser_items_at_path":
                 path = params.get("path", "")
                 response["result"] = self.get_browser_items_at_path(path)
-            # Read-only arrangement command – no main-thread scheduling required
+            # Arrangement reads use the same main-thread queue as snapshots.
             elif command_type == "get_arrangement_clips":
                 track_index = params.get("track_index", 0)
-                response["result"] = self._get_arrangement_clips(track_index)
+                response["result"] = self._read_song_on_main_thread(
+                    lambda: self._get_arrangement_clips(track_index))
+            elif command_type == "get_arrangement_clip_notes":
+                response["result"] = self._read_song_on_main_thread(
+                    lambda: self._get_arrangement_clip_notes(
+                        params.get("track_index", 0), params.get("clip_index", 0),
+                        params.get("offset", 0), params.get("limit", 64)))
             elif command_type == "get_groove_pool":
                 response["result"] = self._get_groove_pool()
             elif command_type == "investigate_render_capability":
@@ -2084,8 +2091,9 @@ class AbletonMCP(ControlSurface):
             clips = []
 
             # track.arrangement_clips is available in Live 11 / 12
-            for clip in track.arrangement_clips:
+            for clip_index, clip in enumerate(track.arrangement_clips):
                 clips.append({
+                    "clip_index": clip_index,
                     "name": clip.name,
                     "start_time": clip.start_time,
                     "end_time": clip.end_time,
@@ -2105,6 +2113,65 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error getting arrangement clips: " + str(e))
             raise
+
+    def _get_arrangement_clip_notes(self, track_index, clip_index, offset=0, limit=64):
+        """Read one MIDI clip, with bounded pages and no Set modifications."""
+        for name, value in (("track_index", track_index), ("clip_index", clip_index),
+                            ("offset", offset), ("limit", limit)):
+            if type(value) is not int or value < 0:
+                raise ValueError("%s must be a non-negative integer" % name)
+        if not 1 <= limit <= 128:
+            raise ValueError("limit must be between 1 and 128")
+        if track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if clip_index >= len(track.arrangement_clips):
+            raise IndexError("Arrangement clip index out of range")
+        clip = track.arrangement_clips[clip_index]
+        if not clip.is_midi_clip:
+            raise ValueError("Arrangement clip is not a MIDI clip")
+        if not hasattr(clip, "get_all_notes_extended"):
+            raise RuntimeError("This Live version does not support get_all_notes_extended")
+
+        # Unlike a length-based query, this includes notes outside the visible
+        # markers of cropped/looped clips. Note times are absolute clip beats,
+        # not Arrangement beats; return markers so callers can interpret them.
+        # Let API errors propagate: an unreadable clip is not an empty clip.
+        raw = list(clip.get_all_notes_extended())
+        raw.sort(key=lambda n: (n.start_time, n.pitch, n.note_id))
+        if offset > len(raw):
+            raise ValueError("offset exceeds total_note_count; restart pagination")
+        notes = []
+        for note in raw[offset:offset + limit]:
+            item = {"note_id": int(note.note_id), "pitch": int(note.pitch),
+                    "start_time": float(note.start_time), "duration": float(note.duration),
+                    "velocity": float(note.velocity), "mute": bool(note.mute)}
+            for name in ("probability", "velocity_deviation", "release_velocity"):
+                if hasattr(note, name):
+                    item[name] = float(getattr(note, name))
+            notes.append(item)
+        result = {
+            "track_index": track_index, "track_name": track.name,
+            "clip_index": clip_index, "clip_name": clip.name,
+            "arrangement_start": float(clip.start_time),
+            "arrangement_end": float(clip.end_time), "length": float(clip.length),
+            "start_marker": float(clip.start_marker), "end_marker": float(clip.end_marker),
+            "loop_start": float(clip.loop_start), "loop_end": float(clip.loop_end),
+            "looping": bool(clip.looping), "time_unit": "beats",
+            "note_time_reference": "absolute_clip_time",
+            "note_scope": "all_source_notes_including_outside_markers",
+            "total_note_count": len(raw), "offset": offset, "notes": notes,
+        }
+        while True:
+            next_offset = offset + len(notes)
+            result.update({"returned_note_count": len(notes),
+                           "has_more": next_offset < len(raw),
+                           "next_offset": next_offset if next_offset < len(raw) else None})
+            if len(json.dumps(result, separators=(",", ":")).encode("utf-8")) <= 24000:
+                return result
+            if len(notes) <= 1:
+                raise RuntimeError("Clip metadata or note exceeds the 24000-byte page budget")
+            notes.pop()
 
     def _clear_notes_from_clip(self, track_index, clip_index):
         """Remove all MIDI notes from a Session clip.

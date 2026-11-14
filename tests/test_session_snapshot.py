@@ -312,3 +312,106 @@ def test_installer_bundle_matches_remote_script():
     bundle = ROOT / 'MCP_Server/bundled_ableton_remote_script/AbletonMCP_init.py'
     assert source.read_bytes() == bundle.read_bytes()
     assert ('SCRIPT_VERSION = "' + install.EXPECTED_REMOTE_SCRIPT_VERSION + '"') in source.read_text()
+
+
+def arrangement_note(pitch=60, start=0., note_id=1):
+    return NS(pitch=pitch, start_time=start, note_id=note_id, duration=.5,
+              velocity=100., mute=False, probability=.8,
+              velocity_deviation=0., release_velocity=64.)
+
+
+def arrangement_clip(notes):
+    c = clip()
+    c.start_marker, c.end_marker = 8., 12.
+    c.start_time, c.end_time = 64., 68.
+    c.get_all_notes_extended = lambda: notes
+    return c
+
+
+def test_arrangement_note_pages_preserve_all_source_notes_and_timing(surface):
+    notes = [arrangement_note(67, 9., 3), arrangement_note(62, -2., 1),
+             arrangement_note(64, 25., 4), arrangement_note(60, 9., 2)]
+    t = surface._song.tracks[0]
+    t.arrangement_clips.append(arrangement_clip(notes))
+    # Session slot and Arrangement index zero contain unrelated notes.
+    first = surface._get_arrangement_clip_notes(0, 1, limit=2)
+    second = surface._get_arrangement_clip_notes(0, 1, offset=first['next_offset'], limit=2)
+    assert [n['note_id'] for n in first['notes'] + second['notes']] == [1, 2, 3, 4]
+    assert first['total_note_count'] == 4
+    assert first['returned_note_count'] == 2 and first['has_more']
+    assert second['next_offset'] is None and not second['has_more']
+    assert first['arrangement_start'] == 64. and first['start_marker'] == 8.
+    assert first['note_time_reference'] == 'absolute_clip_time'
+    assert first['notes'][0]['start_time'] == -2.
+    assert second['notes'][-1]['start_time'] == 25.
+    assert first['notes'][0]['probability'] == .8
+
+
+def test_arrangement_note_pages_respect_byte_budget(surface):
+    import json
+    notes = [arrangement_note(note_id=i) for i in range(300)]
+    surface._song.tracks[0].arrangement_clips = [arrangement_clip(notes)]
+    result_ids, offset = [], 0
+    while offset is not None:
+        page = surface._get_arrangement_clip_notes(0, 0, offset, 128)
+        assert len(json.dumps(page, separators=(',', ':')).encode()) <= 24000
+        assert page['returned_note_count'] > 0
+        result_ids.extend(n['note_id'] for n in page['notes'])
+        offset = page['next_offset']
+    assert result_ids == list(range(300))
+
+
+@pytest.mark.parametrize('kwargs', [dict(track_index=-1), dict(track_index=1),
+    dict(clip_index=-1), dict(clip_index=1), dict(offset=-1), dict(offset=2),
+    dict(limit=0), dict(limit=129), dict(offset=1.5), dict(limit=True)])
+def test_arrangement_note_invalid_requests_fail(surface, kwargs):
+    surface._song.tracks[0].arrangement_clips = [arrangement_clip([arrangement_note()])]
+    params = dict(track_index=0, clip_index=0)
+    params.update(kwargs)
+    with pytest.raises((IndexError, ValueError)):
+        surface._get_arrangement_clip_notes(**params)
+
+
+def test_arrangement_notes_distinguish_empty_audio_and_api_failure(surface):
+    c = arrangement_clip([])
+    surface._song.tracks[0].arrangement_clips = [c]
+    page = surface._get_arrangement_clip_notes(0, 0)
+    assert page['notes'] == [] and page['total_note_count'] == 0
+    assert page['next_offset'] is None
+    c.is_midi_clip = False
+    with pytest.raises(ValueError, match='not a MIDI clip'):
+        surface._get_arrangement_clip_notes(0, 0)
+    c.is_midi_clip = True
+    def broken():
+        raise RuntimeError('Live API failure')
+    c.get_all_notes_extended = broken
+    with pytest.raises(RuntimeError, match='Live API failure'):
+        surface._get_arrangement_clip_notes(0, 0)
+    del c.get_all_notes_extended
+    with pytest.raises(RuntimeError, match='does not support'):
+        surface._get_arrangement_clip_notes(0, 0)
+
+
+@pytest.mark.parametrize('action', ['get_arrangement_clips', 'get_arrangement_clip_notes'])
+def test_arrangement_reads_dispatch_on_main_thread(surface, action):
+    main = threading.get_ident()
+    current = song()
+    current.tracks[0].arrangement_clips = [arrangement_clip([arrangement_note()])]
+    class BoundSong:
+        def __getattr__(self, key):
+            assert threading.get_ident() == main
+            return getattr(current, key)
+    surface.song = lambda: BoundSong()
+    result = []
+    worker = threading.Thread(target=lambda: result.append(surface._process_command(
+        {'type': action, 'params': {'track_index': 0, 'clip_index': 0}})))
+    worker.start()
+    surface.submitted.get(timeout=2)
+    surface.update_display()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert result[0]['status'] == 'success'
+    if action == 'get_arrangement_clips':
+        assert result[0]['result']['clips'][0]['clip_index'] == 0
+    else:
+        assert result[0]['result']['notes'][0]['pitch'] == 60

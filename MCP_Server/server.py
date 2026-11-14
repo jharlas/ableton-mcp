@@ -590,6 +590,9 @@ def get_session_snapshot(
     Includes session metadata, every track (mixer, devices, session clips,
     arrangement clips), optional MIDI notes, and optional device parameters.
     Used to version musical state S_t → S_{t+1}.
+    Large Sets can exceed client response limits. For Arrangement MIDI notes,
+    use get_arrangement_clips then get_arrangement_clip_notes instead of a
+    full snapshot. Disable include_params when device values are not needed.
 
     Parameters:
     - include_notes: Include MIDI note arrays in clips (default True)
@@ -1234,7 +1237,8 @@ def get_arrangement_clips(ctx: Context, track_index: int, user_prompt: str = "")
     """
     List all clips placed in the Arrangement timeline for a track.
 
-    Returns each clip's name, start_time, end_time, length, and type.
+    Returns each clip's clip_index, name, start_time, end_time, length, and type.
+    Use clip_index with get_arrangement_clip_notes to read MIDI notes in pages.
 
     Parameters:
     - track_index: The index of the track to inspect
@@ -1247,6 +1251,54 @@ def get_arrangement_clips(ctx: Context, track_index: int, user_prompt: str = "")
     except Exception as e:
         logger.error(f"Error getting arrangement clips: {str(e)}")
         return f"Error getting arrangement clips: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_arrangement_clip_notes")
+@trajectory_tool("get_arrangement_clip_notes", modifying=False)
+def get_arrangement_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    offset: int = 0,
+    limit: int = 64,
+    user_prompt: str = "",
+) -> str:
+    """Read one Arrangement MIDI clip without a full snapshot or a Session copy.
+
+    First use get_arrangement_clips(track_index) to find the zero-based
+    clip_index. Returns note IDs, pitch, start_time, duration, velocity, mute,
+    and available probability/velocity fields. Times are in beats of absolute
+    clip time, NOT Arrangement time. All source notes are included, even
+    outside clip markers; marker and loop metadata accompany each page.
+
+    Start with offset=0 and limit=64 (maximum 128). Responses are compact JSON
+    capped at 24,000 bytes and may contain fewer notes than limit. Follow
+    next_offset until has_more=false; do not assume a single page is complete.
+    Avoid editing the clip while paging; restart at offset=0 after edits.
+    This is read-only and never copies, selects, or alters clips.
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("get_arrangement_clip_notes")
+        if missing:
+            return missing
+        for name, value in (("track_index", track_index), ("clip_index", clip_index),
+                            ("offset", offset), ("limit", limit)):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if not 1 <= limit <= 128:
+            raise ValueError("limit must be between 1 and 128")
+        result = get_ableton_connection().send_command(
+            "get_arrangement_clip_notes",
+            {"track_index": track_index, "clip_index": clip_index,
+             "offset": offset, "limit": limit},
+        )
+        return json.dumps(result, separators=(",", ":"))
+    except Exception as e:
+        logger.exception("Error getting arrangement clip notes")
+        return f"Error getting arrangement clip notes: {e}"
 
 
 @mcp.tool()

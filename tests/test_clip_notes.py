@@ -114,6 +114,30 @@ def test_read_connection_error_is_caught_and_reported(fake_conn):
     assert "boom" in out
 
 
+def test_arrangement_reader_forwards_page_and_returns_compact_json(fake_conn):
+    expected = {"notes": SAMPLE_NOTES, "total_note_count": 300, "next_offset": 67}
+    conn = fake_conn(response=expected)
+    text = server.get_arrangement_clip_notes(None, 3, 2, offset=64, limit=3)
+    assert conn.sent == [("get_arrangement_clip_notes",
+        {"track_index": 3, "clip_index": 2, "offset": 64, "limit": 3})]
+    assert json.loads(text) == expected
+    assert '\n' not in text
+
+
+def test_arrangement_reader_old_script_requires_upgrade(fake_conn, monkeypatch):
+    import MCP_Server.script_handshake as handshake
+    conn = fake_conn()
+    monkeypatch.setattr(handshake, 'require_capability', lambda name: 'Restart Live to update')
+    assert server.get_arrangement_clip_notes(None, 0, 0) == 'Restart Live to update'
+    assert conn.sent == []
+
+
+def test_arrangement_reader_rejects_unbounded_requests(fake_conn):
+    conn = fake_conn()
+    assert 'limit must be between' in server.get_arrangement_clip_notes(None, 0, 0, limit=10000)
+    assert conn.sent == []
+
+
 def test_read_output_feeds_straight_into_add_notes(fake_conn):
     """The reader's note dicts are shaped exactly as add_notes_to_clip wants."""
     conn = fake_conn(response=_sample_response())

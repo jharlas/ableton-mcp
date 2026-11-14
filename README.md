@@ -6,7 +6,7 @@ Personal fork maintained at [jharlas/ableton-mcp](https://github.com/jharlas/abl
 See [BASELINE.md](BASELINE.md) for provenance, the preserved snapshot fixes,
 validation, and the `baseline-2026-11-14` reference tag.
 See [CHANGELOG.md](CHANGELOG.md) for subsequent fixes, including the
-Remote Script 1.18.2 snapshot dispatch fix.
+Remote Script 1.18.2 snapshot dispatch fix and 1.18.3 Arrangement note pages.
 
 **Connect Ableton Live to Claude AI**
 
