@@ -1,7 +1,38 @@
 # AbletonMCP capability map
 
-Living audit of what this Remote Script (`__init__.py`, currently v1.13.0)
-can and can't do. Started 2026-09-19 after a session of live-testing,
+## Current fork status — 2026-11-14
+
+The current source and installer bundle are **Remote Script 1.18.3**.
+Implementation, installation on disk, and verification in a running Live
+instance are separate states. Use `get_remote_script_info` to check the
+actual loaded version; the Python package metadata version is independent.
+
+| Capability/change | Evidence and status as of this update |
+|---|---|
+| 1.18.2 session-info/snapshot main-thread queue | Verified after a Live restart: loaded/expected versions matched; 10 of 10 snapshot requests succeeded across all four notes/parameters combinations. Repeated full snapshots were identical; logs recorded no timeouts and at most 58 ms of Live-side execution. These observations do not guarantee every future Set or UI state will complete within the deadline. |
+| 1.18.3 `get_arrangement_clip_notes` | Implemented, installed on disk, and registered in the MCP tool schema. Read-only, per-clip note pages default to 64 notes and are capped at 24,000 bytes. **Live execution remains pending verification after a restart.** |
+| 1.18.3 Arrangement clip listing | Adds explicit `clip_index` and uses the main-thread queue. Automated dispatch coverage passes; live verification of the updated path is pending. |
+| Regression suite at 1.18.3 | 54 tests passed, including pagination without gaps, byte limits, notes outside markers, errors, main-thread dispatch, and matching source/bundle versions. Unit tests do not substitute for Live verification. |
+
+The Arrangement reader includes all source MIDI notes, including notes
+outside clip markers. It reports absolute clip-beat times and separate
+placement/loop metadata; it does not render loop repetitions into an audible
+Arrangement performance. API failures are errors, not empty note lists.
+
+See [Reading MIDI notes](../README.md#reading-midi-notes) for tool selection,
+pagination and time semantics, [Troubleshooting](../README.md#troubleshooting)
+for timeouts versus response truncation, and [CHANGELOG.md](../CHANGELOG.md)
+for the changes since the baseline.
+
+## Historical audit — v1.13.0
+
+The remainder records the earlier audit and its original verification
+claims. It has not been revalidated in full on 1.18.3. References to "this
+session", missing wrappers, and private memory notes below belong to that
+historical audit, not the current installation or public documentation.
+
+Audit of what Remote Script v1.13.0 could and couldn't do.
+Started 2026-09-19 after a session of live-testing,
 patching, and root-causing real bugs against Live 12.4.6 — not a spec, a
 record of what was actually verified working, kept honest about the
 difference between "implemented" and "confirmed."

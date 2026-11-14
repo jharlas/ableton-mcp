@@ -27,6 +27,12 @@ MCP server reloads and exposes the new tool. Verify the Remote Script reports
 1.18.3 before testing the live command. Automated tests cover paging without
 gaps, byte limits, cropped notes, errors, and main-thread dispatch.
 
+Validation at implementation: 54 automated tests passed; the MCP tool schema
+was checked and source, bundle, and installed script matched byte-for-byte.
+Live execution of the 1.18.3 command remains pending after restart. Usage,
+pagination and timing semantics are documented in
+[Reading MIDI notes](README.md#reading-midi-notes).
+
 ## Remote Script 1.18.2 — 2026-11-14
 
 Fix the cross-thread handoff for `get_session_info` and
@@ -53,6 +59,12 @@ Restart Live after installation; reselecting the control surface may retain
 cached code. Verify `get_remote_script_info` reports `1.18.2`, then repeat
 read-only snapshots with notes and parameters both enabled and disabled.
 Unit tests do not establish that the new script is loaded in Live.
+
+Subsequent live verification on 2026-11-14: loaded and expected versions
+both reported 1.18.2; all 10 snapshot requests succeeded, including all
+notes/parameters combinations and repeated full snapshots. The repeated
+full responses were identical. Live-side logs reported no timeouts and a
+maximum read execution time of 58 ms. All calls were read-only.
 
 This change covers the two session read commands; other command dispatch
 paths are unchanged.

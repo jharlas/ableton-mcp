@@ -1,5 +1,10 @@
 # Personal fork baseline
 
+This is a historical record of the `baseline-2026-11-14` tag, not the
+current version. For later changes, see [CHANGELOG.md](CHANGELOG.md); for
+current usage and verification status, see [README.md](README.md) and the
+[capability map](AbletonMCP_Remote_Script/CAPABILITIES.md).
+
 Recorded on 2026-11-14. This fork starts from
 [Tompz/ableton-mcp](https://github.com/Tompz/ableton-mcp) at
 `c47a2c340c5e07e0a72bc7eff7db1f542cfd8c1a`, preserving its history and MIT
