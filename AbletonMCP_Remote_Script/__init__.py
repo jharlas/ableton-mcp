@@ -21,7 +21,7 @@ HOST = "0.0.0.0"
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.18.1"
+SCRIPT_VERSION = "1.18.2"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -98,6 +98,7 @@ class AbletonMCP(ControlSurface):
         
         # Cache the song reference for easier access
         self._song = self.song()
+        self._initialize_song_reads()
 
         # Passive human-UI event queue (drained by MCP → Supabase)
         self._passive_events = []
@@ -126,6 +127,7 @@ class AbletonMCP(ControlSurface):
         """Called when Ableton closes or the control surface is removed"""
         self.log_message("AbletonMCP disconnecting...")
         self.running = False
+        self._close_song_reads()
 
         try:
             self._teardown_passive_listeners()
@@ -714,30 +716,131 @@ class AbletonMCP(ControlSurface):
             "passive_listeners": True,
         }
     
-    def _read_song_on_main_thread(self, reader):
-        """Live objects must not be dereferenced on a socket worker thread."""
-        replies = queue.Queue()
+    _SONG_READ_TIMEOUT = 8.0
+    _SONG_READ_QUEUE_SIZE = 32
+    _SONG_READS_PER_TICK = 2
 
-        def collect():
-            try:
-                # Reacquire the current Live binding after Set changes.
-                self._song = self.song()
-                self.log_message("Song read %s on thread %s" % (
-                    reader.__name__, threading.current_thread().name))
-                replies.put((True, reader()))
-            except Exception as exc:
-                self.log_message("Song read failed on main thread\n" + traceback.format_exc())
-                replies.put((False, exc))
+    def _initialize_song_reads(self):
+        # Called on Live's main thread before the socket server starts.
+        self._song_read_thread_id = threading.get_ident()
+        self._song_reads = queue.Queue(maxsize=self._SONG_READ_QUEUE_SIZE)
+        self._song_read_guard = threading.Lock()
+        self._song_read_sequence = 0
+        self._song_reads_closed = False
 
-        # Never fall back to executing Live API calls on the worker thread.
-        self.schedule_message(1, collect)
+    def update_display(self):
+        # Never add tasks to Live's scheduler from a socket worker. Its task
+        # list can be replaced concurrently and silently lose those additions.
         try:
-            ok, result = replies.get(timeout=8.0)
-        except queue.Empty:
-            raise RuntimeError("Timed out waiting for Live main-thread Song read")
+            ControlSurface.update_display(self)
+        finally:
+            if hasattr(self, "_song_reads"):
+                self._drain_song_reads()
+
+    def _song_read_timeout_error(self, request, phase):
+        return RuntimeError(
+            "Timed out waiting for Live main-thread Song read "
+            "(request_id=%d phase=%s waited=%.3fs)" % (
+                request["id"], phase, time.monotonic() - request["queued_at"]))
+
+    def _read_song_on_main_thread(self, reader):
+        """Enqueue from workers; only update_display may execute queued reads."""
+        with self._song_read_guard:
+            if self._song_reads_closed:
+                raise RuntimeError("Live Song-read dispatcher is disconnected")
+            on_main_thread = threading.get_ident() == self._song_read_thread_id
+            if not on_main_thread:
+                self._song_read_sequence += 1
+                now = time.monotonic()
+                request = {
+                    "id": self._song_read_sequence, "reader": reader,
+                    "queued_at": now, "deadline": now + self._SONG_READ_TIMEOUT,
+                    "state": "queued", "result": None,
+                    "lock": threading.Lock(), "done": threading.Event(),
+                }
+                try:
+                    self._song_reads.put_nowait(request)
+                except queue.Full:
+                    raise RuntimeError("Live Song-read queue is full; retry later")
+
+        if on_main_thread:
+            self._song = self.song()
+            return reader()
+
+        request["done"].wait(max(0.0, request["deadline"] - time.monotonic()))
+        with request["lock"]:
+            # Check the result under the lock even if Event.wait timed out:
+            # completion may have won the race immediately afterward.
+            if request["result"] is None:
+                phase = "execution" if request["state"] == "running" else "queue"
+                request["result"] = (False, self._song_read_timeout_error(request, phase))
+                request["state"] = "expired"
+                request["done"].set()
+            ok, result = request["result"]
         if not ok:
             raise result
         return result
+
+    def _drain_song_reads(self):
+        if threading.get_ident() != self._song_read_thread_id:
+            raise RuntimeError("Song-read queue must be drained on Live's main thread")
+        for _ in range(self._SONG_READS_PER_TICK):
+            try:
+                request = self._song_reads.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                with request["lock"]:
+                    if request["state"] != "queued":
+                        continue
+                    if time.monotonic() >= request["deadline"]:
+                        request["state"] = "expired"
+                        request["result"] = (False, self._song_read_timeout_error(request, "queue"))
+                        request["done"].set()
+                        continue
+                    request["state"] = "running"
+                started = time.monotonic()
+                self.log_message("Song read start request_id=%d queue_wait=%.3fs" % (
+                    request["id"], started - request["queued_at"]))
+                try:
+                    self._song = self.song()
+                    result = (True, request["reader"]())
+                except Exception as exc:
+                    self.log_message("Song read failed request_id=%d\n%s" % (
+                        request["id"], traceback.format_exc()))
+                    result = (False, exc)
+                with request["lock"]:
+                    # A running Live API call cannot be interrupted safely.
+                    # If its caller expired, discard the late result.
+                    if request["state"] == "running":
+                        if time.monotonic() >= request["deadline"]:
+                            request["state"] = "expired"
+                            request["result"] = (False, self._song_read_timeout_error(request, "execution"))
+                        else:
+                            request["state"] = "completed"
+                            request["result"] = result
+                        request["done"].set()
+                    state = request["state"]
+                self.log_message("Song read end request_id=%d execution=%.3fs state=%s" % (
+                    request["id"], time.monotonic() - started, state))
+            finally:
+                self._song_reads.task_done()
+
+    def _close_song_reads(self):
+        with self._song_read_guard:
+            self._song_reads_closed = True
+            while True:
+                try:
+                    request = self._song_reads.get_nowait()
+                except queue.Empty:
+                    break
+                with request["lock"]:
+                    if request["state"] == "queued":
+                        request["state"] = "cancelled"
+                        request["result"] = (False, RuntimeError(
+                            "Live disconnected before Song read request_id=%d started" % request["id"]))
+                        request["done"].set()
+                self._song_reads.task_done()
 
     def _snapshot_failure(self, label):
         """Full traceback plus object path; log each property failure once per read."""

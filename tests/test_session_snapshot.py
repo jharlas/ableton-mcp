@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture
 def surface(monkeypatch):
     framework = types.ModuleType('_Framework.ControlSurface')
-    framework.ControlSurface = object
+    class ControlSurface:
+        def update_display(self):
+            self.parent_ticks += 1
+    framework.ControlSurface = ControlSurface
     monkeypatch.setitem(sys.modules, '_Framework', types.ModuleType('_Framework'))
     monkeypatch.setitem(sys.modules, '_Framework.ControlSurface', framework)
     spec = importlib.util.spec_from_file_location('snapshot_remote_test', ROOT / 'AbletonMCP_Remote_Script/__init__.py')
@@ -25,7 +28,39 @@ def surface(monkeypatch):
     obj.log_message = obj.logs.append
     obj._song = song()
     obj.song = lambda: obj._song
+    obj.parent_ticks = 0
+    obj._initialize_song_reads()
+    obj.submitted = queue.Queue()
+    put = obj._song_reads.put_nowait
+    def observe_put(request):
+        put(request)
+        obj.submitted.put(request)
+    obj._song_reads.put_nowait = observe_put
+    def forbidden_schedule(*args):
+        raise AssertionError('Song reads must not use Live task scheduling')
+    obj.schedule_message = forbidden_schedule
     return obj
+
+def start_read(surface, reader):
+    result = []
+    finished = threading.Event()
+    def run():
+        try:
+            result.append(surface._read_song_on_main_thread(reader))
+        except Exception as exc:
+            result.append(exc)
+        finally:
+            finished.set()
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    return worker, result, finished
+
+def finish_read(read):
+    worker, result, finished = read
+    assert finished.wait(2), 'socket worker did not receive its result'
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    return result[0]
 
 def mixer():
     return NS(volume=NS(value=.8), panning=NS(value=0), sends=[])
@@ -55,12 +90,12 @@ def test_dispatch_reads_fresh_song_on_main_thread(surface, action):
             raise TypeError('None(TPyHandle<ASong>)')
     surface._song = StaleSong()
     surface.song = lambda: BoundSong()
-    callbacks = queue.Queue()
-    surface.schedule_message = lambda ticks, callback: callbacks.put(callback)
     result = []
     worker = threading.Thread(target=lambda: result.append(surface._process_command({'type':action,'params':{'include_notes':False,'include_params':False}})))
     worker.start()
-    callbacks.get(timeout=2)()
+    surface.submitted.get(timeout=2)
+    assert result == []
+    surface.update_display()
     worker.join(timeout=2)
     assert not worker.is_alive()
     assert result[0]['status'] == 'success'
@@ -103,11 +138,136 @@ def test_fatal_song_error_has_full_traceback_not_empty_success(surface):
     with pytest.raises(RuntimeError): surface._get_session_snapshot(False,False)
     assert any('Snapshot failed' in line and 'Traceback' in line for line in surface.logs)
 
-def test_scheduling_failure_never_runs_live_reader_on_worker(surface):
-    surface.schedule_message = lambda *args: (_ for _ in ()).throw(AssertionError('scheduler unavailable'))
-    called=[]
-    with pytest.raises(AssertionError): surface._read_song_on_main_thread(lambda:called.append(1))
+def test_expired_waiter_never_runs_reader_on_a_later_tick(surface):
+    surface._SONG_READ_TIMEOUT = .05
+    called = []
+    read = start_read(surface, lambda: called.append(1))
+    surface.submitted.get(timeout=2)
+    error = finish_read(read)
+    assert isinstance(error, RuntimeError)
+    assert 'phase=queue' in str(error)
+    surface.update_display()
     assert called == []
+    assert surface._song_reads.unfinished_tasks == 0
+
+
+def test_deadline_is_checked_before_live_access(surface):
+    called = []
+    read = start_read(surface, lambda: called.append(1))
+    request = surface.submitted.get(timeout=2)
+    with request['lock']:
+        request['deadline'] = 0
+    surface.update_display()
+    assert 'phase=queue' in str(finish_read(read))
+    assert called == []
+
+
+def test_concurrent_reads_are_bounded_and_run_on_main_thread(surface):
+    main = threading.get_ident()
+    reads = [start_read(surface, lambda n=n: (n, threading.get_ident())) for n in range(8)]
+    for _ in reads:
+        surface.submitted.get(timeout=2)
+    surface.update_display()
+    assert surface._song_reads.qsize() == 6
+    for _ in range(3):
+        surface.update_display()
+    assert [finish_read(read) for read in reads] == [(n, main) for n in range(8)]
+    assert surface.parent_ticks == 4
+    assert surface._song_reads.unfinished_tasks == 0
+
+
+def test_enqueue_during_drain_is_not_lost(surface):
+    surface._SONG_READS_PER_TICK = 1
+    subsequent = []
+    def first_reader():
+        subsequent.append(start_read(surface, lambda: 'second'))
+        surface.submitted.get(timeout=2)
+        return 'first'
+    first = start_read(surface, first_reader)
+    surface.submitted.get(timeout=2)
+    surface.update_display()
+    assert finish_read(first) == 'first'
+    assert not subsequent[0][2].is_set()
+    surface.update_display()
+    assert finish_read(subsequent[0]) == 'second'
+
+
+def test_running_read_timeout_discards_late_result(surface):
+    # Shorten the deadline only after execution starts, avoiding scheduler races.
+    def reader():
+        with request['lock']:
+            request['deadline'] = 0
+        return 'too late'
+    read = start_read(surface, reader)
+    request = surface.submitted.get(timeout=2)
+    surface.update_display()
+    error = finish_read(read)
+    assert isinstance(error, RuntimeError)
+    assert 'phase=execution' in str(error)
+    assert request['state'] == 'expired'
+
+
+def test_waiter_can_expire_while_live_reader_is_running(surface):
+    surface._SONG_READ_TIMEOUT = .2
+    entered = []
+    def reader():
+        entered.append(True)
+        assert read[2].wait(2)
+        return 'late result must not replace the timeout'
+    read = start_read(surface, reader)
+    request = surface.submitted.get(timeout=2)
+    surface.update_display()
+    assert entered == [True]
+    error = finish_read(read)
+    assert isinstance(error, RuntimeError)
+    assert 'phase=execution' in str(error)
+    assert request['result'] == (False, error)
+    assert request['state'] == 'expired'
+
+
+def test_disconnect_releases_waiters_and_rejects_new_reads(surface):
+    called = []
+    read = start_read(surface, lambda: called.append(1))
+    surface.submitted.get(timeout=2)
+    surface._close_song_reads()
+    assert 'disconnected before Song read' in str(finish_read(read))
+    surface.update_display()
+    assert called == []
+    with pytest.raises(RuntimeError, match='dispatcher is disconnected'):
+        surface._read_song_on_main_thread(lambda: None)
+
+
+def test_reader_failure_reaches_caller_and_next_read_succeeds(surface):
+    def broken():
+        raise ValueError('Live read failed')
+    first = start_read(surface, broken)
+    surface.submitted.get(timeout=2)
+    second = start_read(surface, lambda: 'healthy')
+    surface.submitted.get(timeout=2)
+    surface.update_display()
+    assert isinstance(finish_read(first), ValueError)
+    assert finish_read(second) == 'healthy'
+    assert any('Song read failed request_id=1' in line for line in surface.logs)
+    assert any('queue_wait=' in line for line in surface.logs)
+    assert any('execution=' in line for line in surface.logs)
+
+
+def test_main_thread_read_executes_directly_with_fresh_song(surface):
+    fresh = song()
+    fresh.tempo = 120
+    surface.song = lambda: fresh
+    assert surface._read_song_on_main_thread(lambda: surface._song.tempo) == 120
+    assert surface._song_reads.empty()
+
+
+def test_full_queue_rejects_extra_request_without_blocking(surface):
+    surface._song_reads.maxsize = 1
+    first = start_read(surface, lambda: 'first')
+    surface.submitted.get(timeout=2)
+    extra = start_read(surface, lambda: 'extra')
+    assert 'queue is full' in str(finish_read(extra))
+    surface.update_display()
+    assert finish_read(first) == 'first'
 
 
 def test_unavailable_master_mixer_does_not_abort_snapshot(surface):
